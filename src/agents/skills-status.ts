@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { OpenClawConfig } from "../config/config.js";
-import { resolveEmojiAndHomepage } from "../shared/entry-metadata.js";
-import { evaluateRequirementsFromMetadata } from "../shared/requirements.js";
+import type { RequirementConfigCheck, Requirements } from "../shared/requirements.js";
+import { evaluateEntryMetadataRequirements } from "../shared/entry-status.js";
 import { CONFIG_DIR } from "../utils.js";
 import {
   hasBinary,
@@ -18,10 +18,7 @@ import {
 } from "./skills.js";
 import { resolveBundledSkillsContext } from "./skills/bundled-context.js";
 
-export type SkillStatusConfigCheck = {
-  path: string;
-  satisfied: boolean;
-};
+export type SkillStatusConfigCheck = RequirementConfigCheck;
 
 export type SkillInstallOption = {
   id: string;
@@ -45,20 +42,8 @@ export type SkillStatusEntry = {
   disabled: boolean;
   blockedByAllowlist: boolean;
   eligible: boolean;
-  requirements: {
-    bins: string[];
-    anyBins: string[];
-    env: string[];
-    config: string[];
-    os: string[];
-  };
-  missing: {
-    bins: string[];
-    anyBins: string[];
-    env: string[];
-    config: string[];
-    os: string[];
-  };
+  requirements: Requirements;
+  missing: Requirements;
   configChecks: SkillStatusConfigCheck[];
   install: SkillInstallOption[];
 };
@@ -89,7 +74,9 @@ function selectPreferredInstallSpec(
   const goSpec = findKind("go");
   const uvSpec = findKind("uv");
 
-  if (prefs.preferBrew && hasBinary("brew") && brewSpec) {
+  const brewAvailable = hasBinary("brew");
+
+  if (prefs.preferBrew && brewAvailable && brewSpec) {
     return brewSpec;
   }
   if (uvSpec) {
@@ -98,11 +85,24 @@ function selectPreferredInstallSpec(
   if (nodeSpec) {
     return nodeSpec;
   }
-  if (brewSpec) {
+  // Only prefer brew when it is actually installed; otherwise skip to
+  // alternatives so Linux/Docker environments without brew get a working
+  // install option instead of a guaranteed failure.
+  if (brewSpec && brewAvailable) {
     return brewSpec;
   }
   if (goSpec) {
     return goSpec;
+  }
+  // Prefer download over an unavailable brew spec.
+  const downloadSpec = findKind("download");
+  if (downloadSpec) {
+    return downloadSpec;
+  }
+  // Last resort: return brew spec even without brew so the caller can
+  // surface a descriptive error rather than "no installer found".
+  if (brewSpec) {
+    return brewSpec;
   }
   return indexed[0];
 }
@@ -184,36 +184,27 @@ function buildSkillStatus(
   const allowBundled = resolveBundledAllowlist(config);
   const blockedByAllowlist = !isBundledSkillAllowed(entry, allowBundled);
   const always = entry.metadata?.always === true;
-  const { emoji, homepage } = resolveEmojiAndHomepage({
-    metadata: entry.metadata,
-    frontmatter: entry.frontmatter,
-  });
   const bundled =
     bundledNames && bundledNames.size > 0
       ? bundledNames.has(entry.skill.name)
       : entry.skill.source === "openclaw-bundled";
 
-  const {
-    required,
-    missing,
-    eligible: requirementsSatisfied,
-    configChecks,
-  } = evaluateRequirementsFromMetadata({
-    always,
-    metadata: entry.metadata,
-    hasLocalBin: hasBinary,
-    hasRemoteBin: eligibility?.remote?.hasBin,
-    hasRemoteAnyBin: eligibility?.remote?.hasAnyBin,
-    localPlatform: process.platform,
-    remotePlatforms: eligibility?.remote?.platforms,
-    isEnvSatisfied: (envName) =>
-      Boolean(
-        process.env[envName] ||
-        skillConfig?.env?.[envName] ||
-        (skillConfig?.apiKey && entry.metadata?.primaryEnv === envName),
-      ),
-    isConfigSatisfied: (pathStr) => isConfigPathTruthy(config, pathStr),
-  });
+  const { emoji, homepage, required, missing, requirementsSatisfied, configChecks } =
+    evaluateEntryMetadataRequirements({
+      always,
+      metadata: entry.metadata,
+      frontmatter: entry.frontmatter,
+      hasLocalBin: hasBinary,
+      localPlatform: process.platform,
+      remote: eligibility?.remote,
+      isEnvSatisfied: (envName) =>
+        Boolean(
+          process.env[envName] ||
+          skillConfig?.env?.[envName] ||
+          (skillConfig?.apiKey && entry.metadata?.primaryEnv === envName),
+        ),
+      isConfigSatisfied: (pathStr) => isConfigPathTruthy(config, pathStr),
+    });
   const eligible = !disabled && !blockedByAllowlist && requirementsSatisfied;
 
   return {
